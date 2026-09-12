@@ -1,0 +1,9 @@
+[package]
+name = "difflint"
+version = "0.1.0"
+edition = "2021"
+authors = ["cratecinder2"]
+license = "MIT"
+description = "A validating parser and pretty printer for unified text diffs"
+
+[dependencies]
