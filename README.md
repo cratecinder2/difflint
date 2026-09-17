@@ -64,6 +64,17 @@ difflint also tolerates the preamble lines git adds (`diff --git ...`,
 `index ...`) before the `--- ` / `+++ ` header pair, so real `git diff`
 output works as-is.
 
+Binary files show up in git diffs as a single marker line instead of a
+`--- `/`+++ ` pair and hunks:
+
+```
+$ difflint binary.diff
+Binary files a/logo.png and b/logo.png differ
+```
+
+which becomes `{"old_path":"a/logo.png","new_path":"b/logo.png","is_binary":true,"hunks":[]}`
+in `--json` mode.
+
 ## Building
 
 Standard `cargo build` / `cargo run` / `cargo test`. No external crates.
@@ -71,8 +82,8 @@ Standard `cargo build` / `cargo run` / `cargo test`. No external crates.
 ## Status
 
 Early skeleton: single-file unified diffs with additions, deletions, context
-lines, and "no newline at end of file" markers all parse and validate. Not
-yet handled: three-way diffs, binary file markers, and combined diffs (`diff
+lines, "no newline at end of file" markers, and binary file markers all
+parse and validate. Not yet handled: three-way and combined diffs (`diff
 --cc`).
 
 ## License

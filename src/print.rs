@@ -6,6 +6,13 @@ pub fn print_human(files: &[FileDiff]) -> String {
         if idx > 0 {
             out.push('\n');
         }
+        if file.is_binary {
+            out.push_str(&format!(
+                "Binary files {} and {} differ\n",
+                file.old_path, file.new_path
+            ));
+            continue;
+        }
         out.push_str(&format!("--- {}\n", file.old_path));
         out.push_str(&format!("+++ {}\n", file.new_path));
         for hunk in &file.hunks {
@@ -49,6 +56,8 @@ pub fn print_json(files: &[FileDiff]) -> String {
         out.push_str(&json_string(&file.old_path));
         out.push_str(",\"new_path\":");
         out.push_str(&json_string(&file.new_path));
+        out.push_str(",\"is_binary\":");
+        out.push_str(if file.is_binary { "true" } else { "false" });
         out.push_str(",\"hunks\":[");
         for (hi, hunk) in file.hunks.iter().enumerate() {
             if hi > 0 {
@@ -112,5 +121,16 @@ mod tests {
         let json = print_json(&files);
         assert!(json.contains("\\\"quoted\\\""));
         assert!(json.starts_with("{\"files\":["));
+    }
+
+    #[test]
+    fn binary_files_print_as_a_single_line_with_no_hunks() {
+        let input = "Binary files a/logo.png and b/logo.png differ\n";
+        let files = parse(input).unwrap();
+        assert_eq!(
+            print_human(&files),
+            "Binary files a/logo.png and b/logo.png differ\n"
+        );
+        assert!(print_json(&files).contains("\"is_binary\":true,\"hunks\":[]"));
     }
 }

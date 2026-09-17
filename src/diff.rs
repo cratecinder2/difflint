@@ -60,6 +60,7 @@ impl Hunk {
 pub struct FileDiff {
     pub old_path: String,
     pub new_path: String,
+    pub is_binary: bool,
     pub hunks: Vec<Hunk>,
 }
 
@@ -88,6 +89,18 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>, ParseError> {
     let mut files = Vec::new();
 
     while i < lines.len() {
+        if lines[i].starts_with("Binary files ") {
+            let (old_path, new_path) = parse_binary_marker(lines[i], i + 1)?;
+            files.push(FileDiff {
+                old_path,
+                new_path,
+                is_binary: true,
+                hunks: Vec::new(),
+            });
+            i += 1;
+            continue;
+        }
+
         if !lines[i].starts_with("--- ") {
             i += 1;
             continue;
@@ -184,6 +197,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>, ParseError> {
         files.push(FileDiff {
             old_path,
             new_path,
+            is_binary: false,
             hunks,
         });
     }
@@ -196,6 +210,26 @@ fn strip_header_path(line: &str, prefix: &str) -> Option<String> {
     // Real tools often append a tab and a timestamp after the path.
     let path = rest.split('\t').next().unwrap_or(rest);
     Some(path.to_string())
+}
+
+/// Parses git's `Binary files a/x and b/x differ` marker, which stands in
+/// place of the usual `--- `/`+++ ` header pair and has no hunks at all.
+fn parse_binary_marker(line: &str, line_no: usize) -> Result<(String, String), ParseError> {
+    let rest = line.strip_prefix("Binary files ").ok_or_else(|| ParseError {
+        line: line_no,
+        message: "malformed binary file marker".to_string(),
+    })?;
+    let rest = rest.strip_suffix(" differ").ok_or_else(|| ParseError {
+        line: line_no,
+        message: "binary file marker is missing the trailing 'differ'".to_string(),
+    })?;
+    let sep = rest.find(" and ").ok_or_else(|| ParseError {
+        line: line_no,
+        message: "binary file marker is missing ' and ' between paths".to_string(),
+    })?;
+    let old_path = rest[..sep].to_string();
+    let new_path = rest[sep + " and ".len()..].to_string();
+    Ok((old_path, new_path))
 }
 
 fn parse_hunk_header(
@@ -286,5 +320,33 @@ mod tests {
         let input = "diff --git a/x b/x\nindex 111..222 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
         let files = parse(input).expect("should parse");
         assert_eq!(files[0].old_path, "a/x");
+    }
+
+    #[test]
+    fn parses_a_binary_file_marker() {
+        let input = "diff --git a/logo.png b/logo.png\nindex 111..222 100644\nBinary files a/logo.png and b/logo.png differ\n";
+        let files = parse(input).expect("should parse");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_binary);
+        assert_eq!(files[0].old_path, "a/logo.png");
+        assert_eq!(files[0].new_path, "b/logo.png");
+        assert!(files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn parses_a_binary_file_marker_for_a_new_file() {
+        let input = "Binary files /dev/null and b/logo.png differ\n";
+        let files = parse(input).expect("should parse");
+        assert_eq!(files[0].old_path, "/dev/null");
+        assert_eq!(files[0].new_path, "b/logo.png");
+    }
+
+    #[test]
+    fn text_and_binary_file_diffs_can_be_mixed() {
+        let input = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n";
+        let files = parse(input).expect("should parse");
+        assert_eq!(files.len(), 2);
+        assert!(!files[0].is_binary);
+        assert!(files[1].is_binary);
     }
 }
