@@ -56,12 +56,67 @@ impl Hunk {
     }
 }
 
+/// One parent's old-file range in a combined (`diff --cc`) hunk header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OldRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+/// A line inside a combined diff hunk, with one marker per parent instead
+/// of the single +/-/space marker a two-file unified diff uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedLine {
+    pub markers: Vec<LineKind>,
+    pub text: String,
+    pub no_newline_at_eof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedHunk {
+    pub old_ranges: Vec<OldRange>,
+    pub new_start: u64,
+    pub new_len: u64,
+    pub section_heading: Option<String>,
+    pub lines: Vec<CombinedLine>,
+}
+
+impl CombinedHunk {
+    /// Lines that are new relative to every parent (all markers are '+').
+    pub fn added_count(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|l| l.markers.iter().all(|m| *m == LineKind::Addition))
+            .count()
+    }
+
+    /// Lines dropped from the merge result (any marker is '-').
+    pub fn removed_count(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|l| l.markers.iter().any(|m| *m == LineKind::Deletion))
+            .count()
+    }
+
+    /// Lines kept in the result but resolved differently against at least
+    /// one parent (neither purely new nor dropped).
+    pub fn merged_count(&self) -> usize {
+        self.lines.len() - self.added_count() - self.removed_count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContent {
+    Binary,
+    Text(Vec<Hunk>),
+    Combined { parents: usize, hunks: Vec<CombinedHunk> },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub old_path: String,
     pub new_path: String,
-    pub is_binary: bool,
-    pub hunks: Vec<Hunk>,
+    pub content: FileContent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +149,7 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>, ParseError> {
             files.push(FileDiff {
                 old_path,
                 new_path,
-                is_binary: true,
-                hunks: Vec::new(),
+                content: FileContent::Binary,
             });
             i += 1;
             continue;
@@ -123,6 +177,117 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>, ParseError> {
             message: "malformed +++ header".to_string(),
         })?;
         i += 1;
+
+        let at_count = if i < lines.len() { count_leading_ats(lines[i]) } else { 0 };
+
+        if at_count >= 3 {
+            let marker = "@".repeat(at_count);
+            let num_parents = at_count - 1;
+            let mut hunks = Vec::new();
+
+            while i < lines.len() && lines[i].starts_with(&marker) {
+                let header_line_no = i + 1;
+                let (old_ranges, new_start, new_len, section_heading) =
+                    parse_combined_hunk_header(lines[i], header_line_no, num_parents)?;
+                i += 1;
+
+                let mut body: Vec<CombinedLine> = Vec::new();
+                let mut old_counts = vec![0u64; num_parents];
+                let mut new_count = 0u64;
+
+                while i < lines.len() {
+                    let line = lines[i];
+                    if line.starts_with(&marker) || line.starts_with("--- ") {
+                        break;
+                    }
+                    if line.starts_with('\\') {
+                        if let Some(last) = body.last_mut() {
+                            last.no_newline_at_eof = true;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    let (markers, text): (Vec<LineKind>, &str) = if line.is_empty() {
+                        (vec![LineKind::Context; num_parents], "")
+                    } else if line.len() >= num_parents
+                        && line.as_bytes()[..num_parents]
+                            .iter()
+                            .all(|&b| b == b' ' || b == b'+' || b == b'-')
+                    {
+                        let markers = line[..num_parents]
+                            .chars()
+                            .map(|c| match c {
+                                '+' => LineKind::Addition,
+                                '-' => LineKind::Deletion,
+                                _ => LineKind::Context,
+                            })
+                            .collect();
+                        (markers, &line[num_parents..])
+                    } else {
+                        break;
+                    };
+
+                    let dropped = markers.iter().any(|m| *m == LineKind::Deletion);
+                    if !dropped {
+                        new_count += 1;
+                    }
+                    for (idx, m) in markers.iter().enumerate() {
+                        if *m != LineKind::Addition {
+                            old_counts[idx] += 1;
+                        }
+                    }
+
+                    body.push(CombinedLine {
+                        markers,
+                        text: text.to_string(),
+                        no_newline_at_eof: false,
+                    });
+                    i += 1;
+                }
+
+                for (idx, range) in old_ranges.iter().enumerate() {
+                    if old_counts[idx] != range.len {
+                        return Err(ParseError {
+                            line: header_line_no,
+                            message: format!(
+                                "header claims parent {} has -{},{} but the body has {} line(s) from that parent",
+                                idx + 1,
+                                range.start,
+                                range.len,
+                                old_counts[idx]
+                            ),
+                        });
+                    }
+                }
+                if new_count != new_len {
+                    return Err(ParseError {
+                        line: header_line_no,
+                        message: format!(
+                            "header claims +{},{} but the body has {} new line(s)",
+                            new_start, new_len, new_count
+                        ),
+                    });
+                }
+
+                hunks.push(CombinedHunk {
+                    old_ranges,
+                    new_start,
+                    new_len,
+                    section_heading,
+                    lines: body,
+                });
+            }
+
+            files.push(FileDiff {
+                old_path,
+                new_path,
+                content: FileContent::Combined {
+                    parents: num_parents,
+                    hunks,
+                },
+            });
+            continue;
+        }
 
         let mut hunks = Vec::new();
         while i < lines.len() && lines[i].starts_with("@@ ") {
@@ -197,12 +362,18 @@ pub fn parse(input: &str) -> Result<Vec<FileDiff>, ParseError> {
         files.push(FileDiff {
             old_path,
             new_path,
-            is_binary: false,
-            hunks,
+            content: FileContent::Text(hunks),
         });
     }
 
     Ok(files)
+}
+
+/// Counts the run of leading '@' characters, used to tell a normal `@@ `
+/// hunk header apart from a combined diff's `@@@ ` (or more, for octopus
+/// merges) header.
+fn count_leading_ats(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b'@').count()
 }
 
 fn strip_header_path(line: &str, prefix: &str) -> Option<String> {
@@ -273,6 +444,53 @@ fn parse_hunk_header(
     Ok((old_start, old_len, new_start, new_len, heading))
 }
 
+/// Parses a combined-diff hunk header, e.g. `@@@ -1,4 -1,4 +1,4 @@@` for a
+/// two-parent merge, or with more `@` marks and more `-` ranges for an
+/// octopus merge with additional parents.
+fn parse_combined_hunk_header(
+    line: &str,
+    line_no: usize,
+    num_parents: usize,
+) -> Result<(Vec<OldRange>, u64, u64, Option<String>), ParseError> {
+    let marker = "@".repeat(num_parents + 1);
+    let prefix = format!("{} ", marker);
+    let rest = line.strip_prefix(&prefix).ok_or_else(|| ParseError {
+        line: line_no,
+        message: "malformed combined hunk header".to_string(),
+    })?;
+    let close = rest.find(&marker).ok_or_else(|| ParseError {
+        line: line_no,
+        message: "combined hunk header is missing its closing marker".to_string(),
+    })?;
+    let ranges = rest[..close].trim();
+    let heading = rest[close + marker.len()..].trim();
+    let heading = if heading.is_empty() {
+        None
+    } else {
+        Some(heading.to_string())
+    };
+
+    let tokens: Vec<&str> = ranges.split_whitespace().collect();
+    if tokens.len() != num_parents + 1 {
+        return Err(ParseError {
+            line: line_no,
+            message: format!(
+                "expected {} ranges in combined hunk header, found {}",
+                num_parents + 1,
+                tokens.len()
+            ),
+        });
+    }
+
+    let mut old_ranges = Vec::with_capacity(num_parents);
+    for tok in &tokens[..num_parents] {
+        let (start, len) = parse_range(tok, '-', line_no)?;
+        old_ranges.push(OldRange { start, len });
+    }
+    let (new_start, new_len) = parse_range(tokens[num_parents], '+', line_no)?;
+    Ok((old_ranges, new_start, new_len, heading))
+}
+
 fn parse_range(token: &str, expected_sign: char, line_no: usize) -> Result<(u64, u64), ParseError> {
     let body = token.strip_prefix(expected_sign).ok_or_else(|| ParseError {
         line: line_no,
@@ -304,8 +522,13 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].old_path, "a/old.txt");
         assert_eq!(files[0].new_path, "b/new.txt");
-        assert_eq!(files[0].hunks.len(), 1);
-        assert_eq!(files[0].hunks[0].lines.len(), 4);
+        match &files[0].content {
+            FileContent::Text(hunks) => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].lines.len(), 4);
+            }
+            other => panic!("expected a text diff, got {:?}", other),
+        }
     }
 
     #[test]
@@ -327,10 +550,9 @@ mod tests {
         let input = "diff --git a/logo.png b/logo.png\nindex 111..222 100644\nBinary files a/logo.png and b/logo.png differ\n";
         let files = parse(input).expect("should parse");
         assert_eq!(files.len(), 1);
-        assert!(files[0].is_binary);
+        assert_eq!(files[0].content, FileContent::Binary);
         assert_eq!(files[0].old_path, "a/logo.png");
         assert_eq!(files[0].new_path, "b/logo.png");
-        assert!(files[0].hunks.is_empty());
     }
 
     #[test]
@@ -346,7 +568,33 @@ mod tests {
         let input = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n";
         let files = parse(input).expect("should parse");
         assert_eq!(files.len(), 2);
-        assert!(!files[0].is_binary);
-        assert!(files[1].is_binary);
+        assert!(matches!(files[0].content, FileContent::Text(_)));
+        assert_eq!(files[1].content, FileContent::Binary);
+    }
+
+    #[test]
+    fn parses_a_combined_diff_for_a_two_parent_merge() {
+        let input = "--- a/file.txt\n+++ b/file.txt\n@@@ -1,3 -1,3 +1,3 @@@\n  context line\n +added relative to parent2\n+ added relative to parent1\n- removed relative to parent1\n";
+        let files = parse(input).expect("should parse");
+        assert_eq!(files.len(), 1);
+        match &files[0].content {
+            FileContent::Combined { parents, hunks } => {
+                assert_eq!(*parents, 2);
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].old_ranges.len(), 2);
+                assert_eq!(hunks[0].lines.len(), 4);
+                assert_eq!(hunks[0].added_count(), 0);
+                assert_eq!(hunks[0].removed_count(), 1);
+                assert_eq!(hunks[0].merged_count(), 3);
+            }
+            other => panic!("expected a combined diff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_a_combined_diff_with_a_line_count_mismatch() {
+        let input = "--- a/file.txt\n+++ b/file.txt\n@@@ -1,9 -1,3 +1,3 @@@\n  context line\n";
+        let err = parse(input).unwrap_err();
+        assert!(err.message.contains("parent 1"));
     }
 }
