@@ -92,6 +92,18 @@ $ difflint merge.diff
 difflint validates each parent's old-file line count against the marker
 column for that parent, same as it validates a normal two-file hunk.
 
+If you only care whether a diff is well-formed, e.g. as a pre-commit or CI
+check, `--check-only` skips the pretty-printed output entirely:
+
+```
+$ difflint --check-only example.diff
+example.diff: OK
+$ difflint --check-only broken.diff
+broken.diff: line 3: header claims -1,5 +1,3 but the body has 3 old line(s) and 3 new line(s)
+$ echo $?
+1
+```
+
 ## Building
 
 Standard `cargo build` / `cargo run` / `cargo test`. No external crates.
